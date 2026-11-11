@@ -1,0 +1,193 @@
+Scenario 01: EC2 instance unreachable (security group blocks traffic)
+
+- Services: EC2, VPC (security groups, route tables, network ACLs)
+- Difficulty: Beginner
+- Fault injected: The security group has no inbound rule for HTTP
+
+Symptom
+
+> Ticket: "My web server on EC2 is running, but I can't open the site. The browser keeps loading and then times out. Nothing has changed on the server."
+
+Lab setup
+
+Terraform builds:
+
+- One VPC with a public subnet, an internet gateway, and a route to the internet
+- One EC2 instance (smallest practical instance type) running a simple web server, started through user data
+- One security group attached to the instance
+- A `broken` variable: when `true`, the security group has no inbound HTTP rule
+
+<!-- Add your architecture diagram, then uncomment the line below. -->
+<!-- ![Lab architecture](../../docs/diagrams/scenario-01.png) -->
+
+Prerequisites
+
+- AWS CLI and Terraform installed, with credentials configured for a personal sandbox account
+- Your public IP address, which you can get with `curl https://checkip.amazonaws.com`
+
+Create a `terraform.tfvars` file in this folder (it is git-ignored):
+
+```hcl
+my_ip_cidr = "203.0.113.25/32"   # replace with your own public IP followed by /32
+```
+
+Reproduce the issue
+
+```bash
+terraform init
+terraform apply -var="broken=true"
+terraform output
+```
+
+The outputs are `instance_id`, `public_ip`, `security_group_id`, and `subnet_id`. Use them in the commands below.
+
+Now try to reach the site:
+
+```bash
+curl -v -m 10 http://<public_ip>
+```
+
+Expected result: the request hangs and ends with a timeout (curl exit code 28).
+
+Diagnose
+
+Work through the checks in order. Replace placeholders such as `<instance_id>` with the values from `terraform output`.
+
+1. Read the symptom: timeout or refused?
+
+A timeout means packets are being dropped before they reach the application. "Connection refused" means the traffic reached the instance, but nothing accepted the connection on that port. A timeout points to the network path: security group, network ACL, or route table.
+
+2. Check the instance state and status checks
+
+```bash
+aws ec2 describe-instance-status --instance-ids <instance_id> --include-all-instances
+```
+
+Look for: state `running`, and system and instance status both `ok`. Passing status checks only tell you the instance and its host are healthy. They say nothing about security groups, so the problem is still likely in the network path.
+
+3. Confirm a public IP and a route to the internet
+
+```bash
+aws ec2 describe-instances --instance-ids <instance_id> \
+  --query "Reservations[].Instances[].[PublicIpAddress,SubnetId]"
+
+aws ec2 describe-route-tables \
+  --filters Name=association.subnet-id,Values=<subnet_id>
+```
+
+Look for: a public IPv4 address, and a route for `0.0.0.0/0` that points to an internet gateway (`igw-...`). If the subnet has no explicit route table association, check the VPC's main route table instead. Note the `igw-...` ID for step 6.
+
+4. Inspect the security group
+
+```bash
+aws ec2 describe-security-groups --group-ids <security_group_id> \
+  --query "SecurityGroups[].IpPermissions"
+```
+
+Look for: an inbound rule that allows TCP port 80 from your IP. In the broken lab the list is empty. Security groups deny all inbound traffic by default and drop it silently, which is why you see a timeout instead of an error.
+
+5. Check the network ACL
+
+```bash
+aws ec2 describe-network-acls \
+  --filters Name=association.subnet-id,Values=<subnet_id>
+```
+
+Look for: the default network ACL allows all traffic. A custom one must allow inbound TCP 80 and outbound ephemeral ports (1024-65535), because network ACLs are stateless. In this lab the subnet uses the default network ACL, so you can rule it out.
+
+6. Let VPC Reachability Analyzer find the blocker
+
+```bash
+aws ec2 create-network-insights-path \
+  --source <internet_gateway_id> \
+  --destination <instance_id> \
+  --protocol tcp \
+  --destination-port 80
+
+aws ec2 start-network-insights-analysis \
+  --network-insights-path-id <path_id>
+
+aws ec2 describe-network-insights-analyses \
+  --network-insights-analysis-ids <analysis_id>
+```
+
+Look for: `NetworkPathFound` set to `false`, and an explanation that points to the security group rules. Reachability Analyzer checks configuration, not live traffic, and each analysis may incur a small charge, so check current pricing.
+
+7. Confirm with VPC Flow Logs
+
+Enable flow logs on the instance's network interface, send them to CloudWatch Logs, retry the request, and search for `REJECT` records with destination port 80 from your IP. Flow logs show that traffic was rejected, but not whether the security group or the network ACL rejected it. Records can take a few minutes to appear.
+
+What I saw
+
+_Add your own command output and screenshots here. Remove account IDs and public IP addresses before publishing._
+
+Root cause
+
+The security group attached to the instance had no inbound rule allowing TCP port 80. Security groups block all inbound traffic until a rule allows it, and they drop blocked packets without any response, so the client sees a timeout rather than an error message. Everything else (instance health, public IP, route to the internet gateway, network ACL) was fine.
+
+Fix
+
+Add an inbound rule that allows TCP port 80 from the client's IP range.
+
+Through Terraform (preferred in this lab, so the code stays the source of truth):
+
+```bash
+terraform apply -var="broken=false"
+```
+
+Or directly with the AWS CLI:
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id <security_group_id> \
+  --protocol tcp \
+  --port 80 \
+  --cidr <your_ip>/32
+```
+
+Use your own IP with `/32`, not `0.0.0.0/0`, unless the service is meant to be open to the whole internet. A manual CLI fix is quick, but it creates drift from the Terraform configuration.
+
+Verify the fix:
+
+```bash
+curl -v -m 10 http://<public_ip>
+```
+
+Expected result: an HTTP 200 response from the web server.
+
+Prevention
+
+- Define security groups in infrastructure as code and review changes in pull requests, so a missing or too-broad rule is caught before it ships.
+- Allow only the ports and source ranges a service needs, and reference other security groups instead of IP ranges between application tiers.
+- Monitor the endpoint (for example with a Route 53 health check or a CloudWatch Synthetics canary) so the team is alerted before the customer is.
+- Use VPC Reachability Analyzer to validate network changes.
+
+Variants to try
+
+Each change below produces a different symptom, so practice telling them apart.
+
+| Change | What you will see | Why |
+| Stop the web service on the instance (needs shell access, for example through SSM Session Manager) | Connection refused | Traffic reaches the instance, but nothing is listening on port 80 |
+| Allow port 8080 instead of 80 | Timeout | The security group does not allow the port you are using |
+| Use the wrong source IP (for example, your ISP changed your address) | Timeout | The source range no longer matches the client |
+| Remove the `0.0.0.0/0` route to the internet gateway | Timeout | Replies have no route back to the internet |
+| Add a custom network ACL that denies inbound port 80 | Timeout | The network ACL drops traffic before it reaches the security group |
+
+Key takeaways
+
+- Timeout versus refused tells you where to look first.
+- Passing instance status checks does not mean the instance is reachable.
+- Check in a fixed order so you do not skip a layer: instance state, route, security group, network ACL, then the OS and application.
+- Fix the code, not just the console, so the next deploy does not bring the fault back.
+
+Clean up
+
+```bash
+terraform destroy
+```
+
+Also delete anything you created by hand: the Reachability Analyzer path and analyses, plus any Flow Logs and their CloudWatch log group.
+
+## References
+
+AWS documentation: Security group rules, Network ACLs, VPC Reachability Analyzer, and VPC Flow Logs.
